@@ -1,0 +1,24 @@
+model:
+  type: "xgboost"
+  target_column: "composite_risk_score"
+  random_state: 42
+
+features:
+  numerical:
+    - "annualized_volatility"
+    - "max_drawdown"
+    - "debt_to_equity_ratio"
+    - "sentiment_risk_impact"
+    - "compound_score"
+
+risk_tiers:
+  low: [0, 25]
+  medium: [25, 50]
+  high: [50, 75]
+  very_high: [75, 100]
+
+weights:
+  volatility_weight: 0.35
+  drawdown_weight: 0.25
+  leverage_weight: 0.20
+  sentiment_weight: 0.20
