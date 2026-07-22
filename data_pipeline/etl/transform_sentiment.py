@@ -1,90 +1,96 @@
-import pandas as pd
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from data_pipeline.s3_uploader import upload_dataframe_to_s3
-import boto3
-import io
 import os
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, concat_ws, coalesce, lit, udf
+from pyspark.sql.types import DoubleType, StructField, StructType, StringType
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-class NewsRiskSentimentAnalyzer:
-    def __init__(self):
-        # Initialize VADER sentiment analyzer
-        self.analyzer = SentimentIntensityAnalyzer()
-
-    def calculate_risk_sentiment(self, text: str) -> dict:
-        """
-        Analyzes headline/description text and returns sentiment scores
-        and a risk contribution factor.
-        """
-        if not text or not isinstance(text, str):
-            return {"compound": 0.0, "risk_sentiment_label": "NEUTRAL", "risk_impact": 0.0}
-        
-        scores = self.analyzer.polarity_scores(text)
-        compound = scores["compound"]
-
-        # Map sentiment compound score to Risk Perception:
-        # Negative sentiment increases perceived risk score.
-        if compound <= -0.05:
-            label = "HIGH_RISK_SENTIMENT"
-            risk_impact = abs(compound) * 100  # Converts negative sentiment to risk scale
-        elif compound >= 0.05:
-            label = "LOW_RISK_SENTIMENT"
-            risk_impact = 0.0
-        else:
-            label = "NEUTRAL"
-            risk_impact = 10.0
-
-        return {
-            "compound_score": compound,
-            "risk_sentiment_label": label,
-            "sentiment_risk_impact": risk_impact
-        }
-
-    def process_news_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Processes news DataFrame and appends risk sentiment metrics."""
-        if df.empty:
-            return df
-
-        # Combine title and description for holistic text evaluation
-        df["full_text"] = df["title"].fillna("") + " " + df["description"].fillna("")
-        
-        results = df["full_text"].apply(self.calculate_risk_sentiment)
-        results_df = pd.DataFrame(list(results))
-
-        # Concatenate results back to main dataframe
-        processed_df = pd.concat([df.reset_index(drop=True), results_df.reset_index(drop=True)], axis=1)
-        return processed_df
+# Initialize VADER global instance for UDF serialization
+analyzer = SentimentIntensityAnalyzer()
 
 
-def run_sentiment_etl_pipeline(ticker_symbol: str, date_str: str):
-    """
-    Reads raw news parquet from S3, calculates news risk metrics,
-    and streams processed features back to S3.
-    """
+def compute_sentiment_risk(text):
+    """PySpark UDF function to calculate sentiment and map it to risk impact."""
+    if not text or not isinstance(text, str):
+        return (0.0, "NEUTRAL", 10.0)
+
+    scores = analyzer.polarity_scores(text)
+    compound = float(scores["compound"])
+
+    if compound <= -0.05:
+        label = "HIGH_RISK_SENTIMENT"
+        risk_impact = float(abs(compound) * 100)
+    elif compound >= 0.05:
+        label = "LOW_RISK_SENTIMENT"
+        risk_impact = 0.0
+    else:
+        label = "NEUTRAL"
+        risk_impact = 10.0
+
+    return (compound, label, risk_impact)
+
+
+# Define PySpark Return Schema for the UDF
+sentiment_schema = StructType([
+    StructField("compound_score", DoubleType(), True),
+    StructField("risk_sentiment_label", StringType(), True),
+    StructField("sentiment_risk_impact", DoubleType(), True)
+])
+
+
+def get_spark_session(app_name="EquiRisk-ETL"):
+    """Creates and configures a PySpark Session with S3A Hadoop connector support."""
+    access_key = os.getenv("AWS_ACCESS_KEY_ID", "")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+
+    return (
+        SparkSession.builder
+        .appName(app_name)
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4")
+        .config("spark.hadoop.fs.s3a.access.key", access_key)
+        .config("spark.hadoop.fs.s3a.secret.key", secret_key)
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .getOrCreate()
+    )
+
+
+def run_spark_sentiment_etl(ticker_symbol: str, date_str: str):
+    """Distributed PySpark ETL pipeline for news risk sentiment analysis."""
+    spark = get_spark_session("News-Sentiment-ETL")
     clean_ticker = ticker_symbol.replace(".NS", "")
-    raw_s3_key = f"raw/gnews_articles/dt={date_str}/ticker={clean_ticker}/news.parquet"
-    processed_s3_key = f"processed/sentiment/dt={date_str}/ticker={clean_ticker}/news_risk_features.parquet"
-
     bucket_name = os.getenv("S3_BUCKET_NAME", "equirisk-data-lake")
-    s3_client = boto3.client("s3")
+
+    raw_s3_path = f"s3a://{bucket_name}/raw/gnews_articles/dt={date_str}/ticker={clean_ticker}/news.parquet"
+    processed_s3_path = f"s3a://{bucket_name}/processed/sentiment/dt={date_str}/ticker={clean_ticker}/"
 
     try:
-        # Fetch raw parquet directly from S3 into memory
-        response = s3_client.get_object(Bucket=bucket_name, Key=raw_s3_key)
-        raw_df = pd.read_parquet(io.BytesIO(response["Body"].read()))
+        print(f"Reading raw news from {raw_s3_path}...")
+        df = spark.read.parquet(raw_s3_path)
 
-        # Run NLP risk transformation
-        nlp_engine = NewsRiskSentimentAnalyzer()
-        processed_df = nlp_engine.process_news_dataframe(raw_df)
+        # Concatenate title and description
+        df_combined = df.withColumn(
+            "full_text",
+            concat_ws(" ", coalesce(col("title"), lit("")), coalesce(col("description"), lit("")))
+        )
 
-        # Upload processed risk dataset back to S3
-        upload_dataframe_to_s3(processed_df, processed_s3_key, file_format="parquet")
-        print(f"Sentiment risk ETL complete for {ticker_symbol}")
+        # Register PySpark UDF
+        risk_sentiment_udf = udf(compute_sentiment_risk, sentiment_schema)
+
+        # Extract risk sentiment struct into explicit columns
+        processed_df = df_combined.withColumn("sentiment_metrics", risk_sentiment_udf(col("full_text"))) \
+            .withColumn("compound_score", col("sentiment_metrics.compound_score")) \
+            .withColumn("risk_sentiment_label", col("sentiment_metrics.risk_sentiment_label")) \
+            .withColumn("sentiment_risk_impact", col("sentiment_metrics.sentiment_risk_impact")) \
+            .drop("sentiment_metrics", "full_text")
+
+        # Write partitioned Parquet output back to S3
+        processed_df.write.mode("overwrite").parquet(processed_s3_path)
+        print(f"Successfully processed PySpark sentiment ETL for {ticker_symbol}")
 
     except Exception as e:
-        print(f"Error executing sentiment ETL pipeline: {str(e)}")
+        print(f"Error during PySpark Sentiment ETL: {str(e)}")
+    finally:
+        spark.stop()
 
 
 if __name__ == "__main__":
-    # Test execution for a given date
-    today_str = pd.Timestamp.now().strftime("%Y-%m-%d")
-    run_sentiment_etl_pipeline("RELIANCE.NS", today_str)
+    run_spark_sentiment_etl("RELIANCE.NS", "2026-03-30")

@@ -5,3 +5,7 @@ numpy
 vaderSentiment>=3.3.2
 transformers>=4.36.0
 torch>=2.1.0
+pyspark>=3.5.0
+vaderSentiment>=3.3.2
+boto3>=1.34.0
+python-dotenv>=1.0.0
