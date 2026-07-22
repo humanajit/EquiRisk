@@ -2,3 +2,6 @@ python-dotenv
 requests
 pandas
 numpy
+vaderSentiment>=3.3.2
+transformers>=4.36.0
+torch>=2.1.0
