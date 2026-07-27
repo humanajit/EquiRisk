@@ -1,0 +1,111 @@
+# =========================================================
+# EquiRisk — config.yaml
+# Central place for paths, params, and settings.
+# Secrets (keys/passwords) do NOT go here — see .env instead.
+# =========================================================
+
+project:
+  name: EquiRisk
+  environment: dev          # dev | prod
+
+# ---------------------------------------------------------
+# AWS / S3 — single source of truth, no local persistence
+# ---------------------------------------------------------
+s3:
+  bucket: equirisk-data              # <-- change to your actual bucket name
+  region: ap-south-1
+
+  # Key prefixes (folders) within the bucket
+  paths:
+    raw_prices: raw/prices/          # s3://<bucket>/raw/prices/{ticker}/{date}.json
+    raw_news: raw/news/              # s3://<bucket>/raw/news/{ticker}/{date}.json
+    processed_features: processed/features/   # partitioned parquet, partition=ticker
+    processed_sentiment: processed/sentiment/
+    models: models/                  # models/risk_model_v{n}/model.pkl
+    vectorstore: vectorstore/        # vectorstore/{ticker}/index.faiss
+    logs: logs/pipeline/
+
+# ---------------------------------------------------------
+# Tickers
+# ---------------------------------------------------------
+tickers:
+  master_list_path: config/nifty150_midcap.csv   # local, versioned metadata file
+  suffix: ".NS"                                    # yfinance NSE suffix
+
+# ---------------------------------------------------------
+# Ingestion
+# ---------------------------------------------------------
+ingestion:
+  price_history_years: 5
+  news:
+    lookback_days: 30        # marketaux free-tier realistic window; adjust to your plan
+    articles_per_ticker: 20
+    language: en
+
+# ---------------------------------------------------------
+# ETL / Spark
+# ---------------------------------------------------------
+spark:
+  app_name: EquiRiskETL
+  master: "local[*]"
+  shuffle_partitions: 8
+  s3_endpoint: null          # leave null unless using a non-AWS S3-compatible store
+
+feature_engineering:
+  rolling_windows_days: [20, 60, 90]
+  technical_indicators: [rsi, macd, moving_average]
+
+# ---------------------------------------------------------
+# ML
+# ---------------------------------------------------------
+ml:
+  risk_label:
+    type: classification      # classification | regression
+    horizon_days: 30
+    buckets: [Low, Medium, High]
+  train_test_split: 0.2
+  random_state: 42
+  candidate_models: [logistic_regression, random_forest, xgboost, lightgbm]
+  model_version: v1
+
+# ---------------------------------------------------------
+# RAG / GenAI
+# ---------------------------------------------------------
+rag:
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  chunk_size_tokens: 300
+  chunk_overlap_tokens: 50
+  top_k_retrieval: 5
+  vector_store: faiss        # faiss | chroma
+
+genai:
+  provider: groq
+  model: llama-3.3-70b-versatile    # verify current model availability on Groq before final submission
+  temperature: 0.3
+  max_tokens: 512
+
+# ---------------------------------------------------------
+# Analytics -- beta/Sharpe/risk-score/fundamentals for the dashboard
+# ---------------------------------------------------------
+analytics:
+  benchmark_ticker: "^NSEI"      # Nifty 50 used as broad market benchmark for beta
+                                   # (Yahoo has no reliable single Nifty Midcap150 index
+                                   # ticker for this purpose -- Nifty 50 is a documented
+                                   # simplification, worth stating as such in your report)
+  risk_free_rate_annual: 0.07     # ~India 10Y G-Sec yield, used in Sharpe ratio calc
+  periods:                        # duration options shown in the dashboard's time-period selector
+    "1 Month": 21
+    "3 Months": 63
+    "6 Months": 126
+    "1 Year": 252
+    "2 Years": 504
+  price_chart_default_months: 6
+  price_chart_max_years: 4
+  fundamentals_cache_ttl_seconds: 86400   # fundamentals change slowly -- cache a full day
+
+# ---------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------
+dashboard:
+  cache_ttl_seconds: 300
+  default_view: Overview
